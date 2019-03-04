@@ -3,10 +3,10 @@ package snowflake
 import (
 	"fmt"
 	"math/rand"
+	"reflect"
 	"sort"
+	"sync/atomic"
 	"testing"
-
-	"github.com/influxdata/influxdb/pkg/testing/assert"
 )
 
 func TestEncode(t *testing.T) {
@@ -24,7 +24,9 @@ func TestEncode(t *testing.T) {
 		t.Run(fmt.Sprintf("0x%03x→%s", test.v, test.exp), func(t *testing.T) {
 			var s [11]byte
 			encode(&s, test.v)
-			assert.Equal(t, string(s[:]), test.exp)
+			if got, exp := string(s[:]), test.exp; got != exp {
+				t.Fatalf("got %q, expected %q", got, exp)
+			}
 		})
 	}
 }
@@ -49,7 +51,33 @@ func TestSorting(t *testing.T) {
 	})
 
 	sort.Strings(vals)
-	assert.Equal(t, vals, exp)
+	if !reflect.DeepEqual(vals, exp) {
+		t.Fatalf("got %v, expected %v", vals, exp)
+	}
+}
+
+func TestMachineID(t *testing.T) {
+	for i := 0; i < serverMax; i++ {
+		if got, exp := New(i).MachineID(), i; got != exp {
+			t.Fatalf("got %d, expected %d", got, exp)
+		}
+	}
+}
+
+func TestNextMonotonic(t *testing.T) {
+	g := New(10)
+	out := make([]string, 10000)
+
+	for i := range out {
+		out[i] = g.NextString()
+	}
+
+	// ensure they are all distinct and increasing
+	for i := range out[1:] {
+		if out[i] >= out[i+1] {
+			t.Fatal("bad entries:", out[i], out[i+1])
+		}
+	}
 }
 
 func BenchmarkEncode(b *testing.B) {
@@ -58,6 +86,28 @@ func BenchmarkEncode(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		encode(&s, 100)
 	}
+}
+
+var blackhole uint64 // to make sure the g.Next calls are not removed
+
+func BenchmarkNext(b *testing.B) {
+	g := New(10)
+
+	for i := 0; i < b.N; i++ {
+		blackhole += g.Next()
+	}
+}
+
+func BenchmarkNextParallel(b *testing.B) {
+	g := New(1)
+
+	b.RunParallel(func(pb *testing.PB) {
+		var lblackhole uint64
+		for pb.Next() {
+			lblackhole += g.Next()
+		}
+		atomic.AddUint64(&blackhole, lblackhole)
+	})
 }
 
 func shuffle(n int, swap func(i, j int)) {

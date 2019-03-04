@@ -1,0 +1,36 @@
+/*
+   Chronograf Styles
+   -----------------------------------------------------------------------------
+*/
+
+// Modules
+@import 'modules';
+
+// Fonts
+@import 'fonts/fonts';
+@import 'fonts/icon-font';
+
+// Clockface UI Kit
+@import 'src/clockface/styles';
+
+// Components
+// TODO: Import these styles into their respective components instead of this stylesheet
+@import 'src/shared/components/ColorDropdown';
+@import 'src/shared/components/avatar/Avatar';
+@import 'src/shared/components/tables/TableGraphs';
+@import 'src/shared/components/notifications/Notifications';
+@import 'src/shared/components/threesizer/Threesizer';
+@import 'src/shared/components/graph_tips/GraphTips';
+@import 'src/shared/components/cells/Dashboards';
+@import 'src/shared/components/dygraph/Dygraph';
+@import 'src/shared/components/splash_page/SplashPage';
+@import 'src/shared/components/code_mirror/CodeMirror';
+@import 'src/shared/components/code_mirror/CodeMirrorTheme';
+@import 'src/dashboards/components/dashboard_empty/DashboardEmpty';
+@import 'src/shared/components/views/Markdown';
+@import 'src/shared/components/custom_singular_time/CustomSingularTime';
+@import 'src/onboarding/OnboardingWizard.scss';
+@import 'src/shared/components/columns_options/ColumnsOptions';
+
+// External
+@import '../../node_modules/@influxdata/react-custom-scrollbars/dist/styles.css';

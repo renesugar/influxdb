@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/influxdata/influxdb/pkg/escape"
 )
@@ -160,6 +162,23 @@ const (
 	Unsigned
 )
 
+func (t FieldType) String() string {
+	switch t {
+	case Integer:
+		return "Integer"
+	case Float:
+		return "Float"
+	case Boolean:
+		return "Boolean"
+	case String:
+		return "String"
+	case Empty:
+		return "Empty"
+	default:
+		return "<unknown>"
+	}
+}
+
 // FieldIterator provides a low-allocation interface to iterate through a point's fields.
 type FieldIterator interface {
 	// Next indicates whether there any fields remaining.
@@ -271,36 +290,56 @@ func ParsePointsString(buf string) ([]Point, error) {
 // NOTE: to minimize heap allocations, the returned Tags will refer to subslices of buf.
 // This can have the unintended effect preventing buf from being garbage collected.
 func ParseKey(buf []byte) (string, Tags) {
-	meas, tags := ParseKeyBytes(buf)
-	return string(meas), tags
+	name, tags := ParseKeyBytes(buf)
+	return string(name), tags
 }
 
 func ParseKeyBytes(buf []byte) ([]byte, Tags) {
+	return ParseKeyBytesWithTags(buf, nil)
+}
+
+func ParseKeyBytesWithTags(buf []byte, tags Tags) ([]byte, Tags) {
 	// Ignore the error because scanMeasurement returns "missing fields" which we ignore
 	// when just parsing a key
 	state, i, _ := scanMeasurement(buf, 0)
 
-	var tags Tags
+	var name []byte
 	if state == tagKeyState {
-		tags = parseTags(buf)
+		tags = parseTags(buf, tags)
 		// scanMeasurement returns the location of the comma if there are tags, strip that off
-		return buf[:i-1], tags
+		name = buf[:i-1]
+	} else {
+		name = buf[:i]
 	}
-	return buf[:i], tags
+	return UnescapeMeasurement(name), tags
 }
 
 func ParseTags(buf []byte) Tags {
-	return parseTags(buf)
+	return parseTags(buf, nil)
 }
 
-func ParseName(buf []byte) ([]byte, error) {
+func ParseName(buf []byte) []byte {
 	// Ignore the error because scanMeasurement returns "missing fields" which we ignore
 	// when just parsing a key
 	state, i, _ := scanMeasurement(buf, 0)
+	var name []byte
 	if state == tagKeyState {
-		return buf[:i-1], nil
+		name = buf[:i-1]
+	} else {
+		name = buf[:i]
 	}
-	return buf[:i], nil
+
+	return UnescapeMeasurement(name)
+}
+
+// ValidPrecision checks if the precision is known.
+func ValidPrecision(precision string) bool {
+	switch precision {
+	case "ns", "us", "ms", "s":
+		return true
+	default:
+		return false
+	}
 }
 
 // ParsePointsWithPrecision is similar to ParsePoints, but allows the
@@ -383,13 +422,17 @@ func parsePoint(buf []byte, defaultTime time.Time, precision string) (Point, err
 	}
 
 	var maxKeyErr error
-	walkFields(fields, func(k, v []byte) bool {
+	err = walkFields(fields, func(k, v []byte) bool {
 		if sz := seriesKeySize(key, k); sz > MaxKeyLength {
 			maxKeyErr = fmt.Errorf("max key length exceeded: %v > %v", sz, MaxKeyLength)
 			return false
 		}
 		return true
 	})
+
+	if err != nil {
+		return nil, err
+	}
 
 	if maxKeyErr != nil {
 		return nil, maxKeyErr
@@ -436,16 +479,12 @@ func parsePoint(buf []byte, defaultTime time.Time, precision string) (Point, err
 func GetPrecisionMultiplier(precision string) int64 {
 	d := time.Nanosecond
 	switch precision {
-	case "u":
+	case "us":
 		d = time.Microsecond
 	case "ms":
 		d = time.Millisecond
 	case "s":
 		d = time.Second
-	case "m":
-		d = time.Minute
-	case "h":
-		d = time.Hour
 	}
 	return int64(d)
 }
@@ -1215,7 +1254,7 @@ func EscapeMeasurement(in []byte) []byte {
 	return in
 }
 
-func unescapeMeasurement(in []byte) []byte {
+func UnescapeMeasurement(in []byte) []byte {
 	if bytes.IndexByte(in, '\\') == -1 {
 		return in
 	}
@@ -1299,7 +1338,8 @@ func unescapeStringField(in string) string {
 }
 
 // NewPoint returns a new point with the given measurement name, tags, fields and timestamp.  If
-// an unsupported field value (NaN) or out of range time is passed, this function returns an error.
+// an unsupported field value (NaN, or +/-Inf) or out of range time is passed, this function
+// returns an error.
 func NewPoint(name string, tags Tags, fields Fields, t time.Time) (Point, error) {
 	key, err := pointKey(name, tags, fields, t)
 	if err != nil {
@@ -1311,6 +1351,15 @@ func NewPoint(name string, tags Tags, fields Fields, t time.Time) (Point, error)
 		time:   t,
 		fields: fields.MarshalBinary(),
 	}, nil
+}
+
+// NewPointFromSeries returns a Point given the serialized key, some fields, and a time.
+func NewPointFromSeries(key []byte, fields Fields, t time.Time) Point {
+	return &point{
+		key:    key,
+		time:   t,
+		fields: fields.MarshalBinary(),
+	}
 }
 
 // pointKey checks some basic requirements for valid points, and returns the
@@ -1330,13 +1379,19 @@ func pointKey(measurement string, tags Tags, fields Fields, t time.Time) ([]byte
 		switch value := value.(type) {
 		case float64:
 			// Ensure the caller validates and handles invalid field values
+			if math.IsInf(value, 0) {
+				return nil, fmt.Errorf("+/-Inf is an unsupported value for field %s", key)
+			}
 			if math.IsNaN(value) {
-				return nil, fmt.Errorf("NaN is an unsupported value for field %s", key)
+				return nil, fmt.Errorf("NAN is an unsupported value for field %s", key)
 			}
 		case float32:
 			// Ensure the caller validates and handles invalid field values
+			if math.IsInf(float64(value), 0) {
+				return nil, fmt.Errorf("+/-Inf is an unsupported value for field %s", key)
+			}
 			if math.IsNaN(float64(value)) {
-				return nil, fmt.Errorf("NaN is an unsupported value for field %s", key)
+				return nil, fmt.Errorf("NAN is an unsupported value for field %s", key)
 			}
 		}
 		if len(key) == 0 {
@@ -1460,7 +1515,7 @@ func (p *point) Tags() Tags {
 	if p.cachedTags != nil {
 		return p.cachedTags
 	}
-	p.cachedTags = parseTags(p.key)
+	p.cachedTags = parseTags(p.key, nil)
 	return p.cachedTags
 }
 
@@ -1527,11 +1582,14 @@ func walkTags(buf []byte, fn func(key, value []byte) bool) {
 
 // walkFields walks each field key and value via fn.  If fn returns false, the iteration
 // is stopped.  The values are the raw byte slices and not the converted types.
-func walkFields(buf []byte, fn func(key, value []byte) bool) {
+func walkFields(buf []byte, fn func(key, value []byte) bool) error {
 	var i int
 	var key, val []byte
 	for len(buf) > 0 {
 		i, key = scanTo(buf, 0, '=')
+		if i > len(buf)-2 {
+			return fmt.Errorf("invalid value: field-key=%s", key)
+		}
 		buf = buf[i+1:]
 		i, val = scanFieldValue(buf, 0)
 		buf = buf[i:]
@@ -1544,22 +1602,38 @@ func walkFields(buf []byte, fn func(key, value []byte) bool) {
 			buf = buf[1:]
 		}
 	}
+	return nil
 }
 
-func parseTags(buf []byte) Tags {
+// parseTags parses buf into the provided destination tags, returning destination
+// Tags, which may have a different length and capacity.
+func parseTags(buf []byte, dst Tags) Tags {
 	if len(buf) == 0 {
 		return nil
+	}
+
+	n := bytes.Count(buf, []byte(","))
+	if cap(dst) < n {
+		dst = make(Tags, n)
+	} else {
+		dst = dst[:n]
+	}
+
+	// Ensure existing behaviour when point has no tags and nil slice passed in.
+	if dst == nil {
+		dst = Tags{}
 	}
 
 	// Series keys can contain escaped commas, therefore the number of commas
 	// in a series key only gives an estimation of the upper bound on the number
 	// of tags.
-	tags := make(Tags, 0, bytes.Count(buf, []byte(",")))
+	var i int
 	walkTags(buf, func(key, value []byte) bool {
-		tags = append(tags, Tag{Key: key, Value: value})
+		dst[i].Key, dst[i].Value = key, value
+		i++
 		return true
 	})
-	return tags
+	return dst[:i]
 }
 
 // MakeKey creates a key for a set of tags.
@@ -1571,7 +1645,7 @@ func MakeKey(name []byte, tags Tags) []byte {
 func AppendMakeKey(dst []byte, name []byte, tags Tags) []byte {
 	// unescape the name and then re-escape it to avoid double escaping.
 	// The key should always be stored in escaped form.
-	dst = append(dst, EscapeMeasurement(unescapeMeasurement(name))...)
+	dst = append(dst, EscapeMeasurement(UnescapeMeasurement(name))...)
 	dst = tags.AppendHashKey(dst)
 	return dst
 }
@@ -1607,17 +1681,12 @@ func (p *point) Fields() (Fields, error) {
 // SetPrecision will round a time to the specified precision.
 func (p *point) SetPrecision(precision string) {
 	switch precision {
-	case "n":
-	case "u":
+	case "us":
 		p.SetTime(p.Time().Truncate(time.Microsecond))
 	case "ms":
 		p.SetTime(p.Time().Truncate(time.Millisecond))
 	case "s":
 		p.SetTime(p.Time().Truncate(time.Second))
-	case "m":
-		p.SetTime(p.Time().Truncate(time.Minute))
-	case "h":
-		p.SetTime(p.Time().Truncate(time.Hour))
 	}
 }
 
@@ -2391,4 +2460,31 @@ func appendField(b []byte, k string, v interface{}) []byte {
 	}
 
 	return b
+}
+
+// ValidKeyToken returns true if the token used for measurement, tag key, or tag
+// value is a valid unicode string and only contains printable, non-replacement characters.
+func ValidKeyToken(s string) bool {
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsPrint(r) || r == unicode.ReplacementChar {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidKeyTokens returns true if the measurement name and all tags are valid.
+func ValidKeyTokens(name string, tags Tags) bool {
+	if !ValidKeyToken(name) {
+		return false
+	}
+	for _, tag := range tags {
+		if !ValidKeyToken(string(tag.Key)) || !ValidKeyToken(string(tag.Value)) {
+			return false
+		}
+	}
+	return true
 }
